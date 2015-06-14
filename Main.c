@@ -35,7 +35,7 @@
 #include <stdlib.h>
 
 #include <Core/RtxCore.h>
-#include <Ros/RosCfg.h>
+#include <ROS/RosCfg.h>
 #include <PortDef.h>
 #include <Api/Api.h>
 #include <Cola/Cola.h>
@@ -43,11 +43,15 @@
 #include <NetUtils/NetUtils.h>
 #include <Drivers/DrvButtons.h>
 
+
 #include <PtApps/AppCommon.h>
 #include <PtApps/AppLed.h>
 #include <PtApps/AppSocket.h>
-#include <PtApps/AppWifi.h>
+#include <PtApps/AppWiFi.h>
+#include <PtApps/AppWebconfig.h>
+#include <PtApps/AppSntp.h>
 
+#include <Drivers/DrvIntTemp.h>
 
 #ifdef USE_LUART_TERMINAL
 #include <Drivers/DrvLeuart.h>
@@ -56,6 +60,34 @@
 #ifdef SPI_COMMUNICATION
 #include <Drivers/DrvSpi.h>
 #endif
+
+
+//*******TEST ALEJANDRO CASTRO******//
+
+#include <RtxEai/RtxEai.h>
+#include <Drivers/DrvSpiSlave.h>
+#include <BuildInfo/BuildInfo.h>
+// For debug (EAI)
+#define printf(...) RtxEaiPrintf(ColaIf->ColaTaskId,__VA_ARGS__)
+// Data for configure softAP
+#define SOFT_AP_STATIC_IP       "192.168.1.88"
+#define SOFT_AP_SUBNET_MASK     "255.255.255.0"
+#define SOFT_AP_GATEWAY         "192.168.1.1"
+#define SOFT_AP_DHCP            TRUE
+#define SOFT_AP_ESSID           "SCK_AP_" //partial SSID
+#define SOFT_AP_SECURITY_TYPE   AWST_NONE
+#define SOFT_AP_COUNTRY_CODE    "ES"
+#define SOFT_AP_CHANNEL         2437 //Channel 6 center frequency
+#define SOFT_AP_INACT           10 // minutes
+#define SOFT_AP_BEACON          100 // ms
+#define GATEWAY     "192.168.1.1"
+#define DATE_STR_LEN 30
+#define HTTP_PORT 80
+#define RX_IDLE_TIMEOUT  (30*RS_T1SEC)
+
+#define SOFT_AP_DHCP_POOL_START 0xC0A801C8 //"192.168.1.200"
+#define SOFT_AP_DHCP_POOL_END   0xC0A801FF //"192.168.1.255"
+#define SOFT_AP_LEASE_TIME      86400
 
 
 
@@ -87,15 +119,30 @@
 typedef struct {
   ApInfoType ap_info;
   rsuint8 use_dhcp;
+  struct pt ChildPt;
+  PtEntryType* PtEntryPtr; 
+  rschar DateStr[DATE_STR_LEN];
+  rsint16 Temperature;
+  rsint16 Humidity;
+  rsint32 Pressure;
+  rsint16 Lux;
+  rsbool MultiSensor;
+  rsbool HttpServerStarted;
+  rsuint8 SPI1 [5];
+  rschar HWVERSION[25];
+  rschar SWVERSION[25];
+  rschar platform [30];
+  rsuint32 HttpInstance;
   ApiSocketAddrType static_address, static_subnet, static_gateway;
-} AppDataType;
-
+} app_dataType;
+ 
 
 /****************************************************************************
 *                            Global variables/const
 ****************************************************************************/
 // Static application data
-static AppDataType app_data;
+static app_dataType app_data;
+
 
 // Timers
 static const RosTimerConfigType PacketDelayTimer =
@@ -136,7 +183,6 @@ char *argv[MAX_ARGV];
 // TCP send/receive/ buffers
 rsuint8 tx_buffer[TX_BUFFER_LENGTH];
 rsuint8 rx_buffer[TX_BUFFER_LENGTH];
-
 
 /****************************************************************************
 *                                Implementation
@@ -314,7 +360,7 @@ int extract_substring(rsuint8 *dest, rsuint8 *orig, int orig_ptr) {
  **/
 void Wifi_save_appInfo_to_NVS() {
   NvsWrite(NVS_OFFSET(Free),
-           sizeof(AppDataType),
+           sizeof(app_dataType),
            (rsuint8*)&app_data);
 }
 
@@ -323,7 +369,7 @@ void Wifi_save_appInfo_to_NVS() {
  **/
 void Wifi_read_appInfo_from_NVS() {
   NvsRead(NVS_OFFSET(Free),
-          sizeof(AppDataType),
+          sizeof(app_dataType),
           (rsuint8 *)&app_data);
 }
 
@@ -488,6 +534,7 @@ static PT_THREAD(PtWifi_suspend(struct pt *Pt, const RosMailType *Mail)) {
   SendApiWifiSuspendReq(COLA_TASK, 10*60*1000); // ms
   PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_WIFI_SUSPEND_CFM));
   POWER_TEST_PIN_TOGGLE;
+  void EMU_EnterEM2();
   EMU_EnterEM2(); // uC enter suspend, too. Use an external interrupt to wake up!
   PT_END(Pt);
 }
@@ -929,6 +976,542 @@ static PT_THREAD(PtWifi_TCP_start(struct pt *Pt, const RosMailType *Mail, ApiSoc
   PT_END(Pt);
 }
 
+//////////////////**************ALEJANDRO CASTRO IMPLEMENTATION***********///////////////////////
+/*
+ * @brief Sets the softAP mode
+ * @param Pt : current protothread pointer
+ * @param Mail : protothread mail
+*/
+static PT_THREAD(SoftAPMode(struct pt *Pt, const RosMailType *Mail)) {
+    static struct pt childPt;
+    PT_BEGIN(Pt);
+    // Reset Wifi
+    PT_SPAWN(Pt, &childPt, PtAppWifiReset(&childPt, Mail));
+	
+	// Set power save parameters  
+    AppWifiSetPowerSaveProfile(POWER_SAVE_HIGH_IDLE); // 200ms idle interval
+    AppWifiSetListenInterval(100);   	// 100ms     
+    	
+    const ApiWifiMacAddrType *pMacAddr = AppWifiGetMacAddr();
+	
+	//Set parameteres SoftAP
+    //SSID = MASK + MAC
+    rsuint8 ssid[32];	
+    snprintf((char*)ssid, sizeof(ssid), "%s%02X%02X%02X", 
+            SOFT_AP_ESSID, (*pMacAddr)[3], (*pMacAddr)[4], (*pMacAddr)[5]);
+    AppWifiApSetSoftApInfo((rsuint8*)ssid, SOFT_AP_SECURITY_TYPE, 
+            FALSE, 0, NULL, SOFT_AP_CHANNEL, SOFT_AP_INACT, 
+            (rsuint8*)SOFT_AP_COUNTRY_CODE, SOFT_AP_BEACON);
+    
+    //Start SoftAP
+    PT_SPAWN(Pt, &childPt, PtAppWifiStartSoftAp(&childPt, Mail));
+    //static IP
+    ApiIpV4AddressType address, subnetMask;
+    inet_aton(SOFT_AP_STATIC_IP , &address);
+    inet_aton(SOFT_AP_SUBNET_MASK, &subnetMask);
+    AppWifiIpv4Config(true,address,subnetMask,address,address);
+	//start SOFT Dhcp
+    SendApiWifiApSetDhcpPoolReq(COLA_TASK, SOFT_AP_DHCP_POOL_START, SOFT_AP_DHCP_POOL_END, SOFT_AP_LEASE_TIME);     
+    //wait a client
+    PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_WIFI_CONNECT_IND));
+
+    PT_END(Pt);
+}
+
+// Definition Header HTTP
+static rsuint32 AddHeader(rsuint8 *BufferPtr, rsuint32 BufferLength, rsuint8* DataPtr, rsuint32 Instance)
+{
+  rsuint8 *p = BufferPtr;
+  rsuint32 l = 0;
+
+  l += HttpAddHeader(p+l, BufferLength-l, "Content-Type", "text/html; charset=utf-8");
+  l += HttpAddHeader(p+l, BufferLength-l, "Server", "RTX41xx demo WEB server");
+  l += HttpAddHeader(p+l, BufferLength-l, "Date", app_data.DateStr);
+
+  return l;
+}
+// Definition Main Page. Display temperatures of SHT21 and RTX4100
+static rsuint32 GenerateMainPage(rsuint8 *BufferPtr, rsuint32 BufferLength, rsuint32 Offset, rsuint8 *DataPtr, rsuint32 Instance)
+{
+  
+  rsuint32 n = 0;
+  rsuint16 l = BufferLength;
+  rschar *p = (rschar*)BufferPtr;
+  const char* const start = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+	"<meta charset='UTF-8'>"
+	"<title>RTX WEBSERVER</title>"
+	"<style>"
+        "body{"
+            "font-family: nunito, sans-serif;"
+            "background: #00131F;"
+        "}"
+        ".boton{"
+            "font-size: 20px;"
+            "background: #00131F;"
+            "color:#329AB4;"
+            "border: solid 3px #00131F;"
+            "font-weight: bolder;"
+            "transition: 2s;"
+        "}"
+        ".boton:hover{"
+            "color:#fff;"
+            "border-bottom: solid 3px #fff;"
+        "}"
+        ".selected{"
+            "font-size: 20px;"
+            "background: #002740;"
+            "color:white;"
+            "border: solid 3px #002740;"
+            "font-weight: bolder;"
+            "transition: 2s;"            
+        "}"
+        ".content{"
+            "background: #002740;"
+            "padding: 2em;"			
+            "text-align: center;"
+            "width: 100%;"
+            "margin: 0 auto;"
+        "}"
+        ".content p{"
+            "margin: 0 auto;"
+            "margin-bottom: 1em;"
+            "margin-top: 1em;"
+            "background-color: #163B52;"
+            "width: 50%s;"
+            "padding: 1em;"
+            "font-weight: bolder;"
+            "color:#fff;"
+            "border: solid 0px white;"
+            "border-radius: 10px;"
+            "box-shadow: 0 0 8px #414141;"
+        "}"
+        ".content p span{"
+            "color:#66d5f0;"
+			"font-size: 1.5em;"
+        "}"
+    "</style>"
+"</head>"
+"<body>"	
+    "<div>"
+        "<input class=\"selected\" type=\"button\" value=\"Inicio\">"
+        "<input class=\"boton\" type=\"button\" value=\"Informacion\" onclick=\"location.href='Info'\">"		
+        "<input class=\"boton\" type=\"button\" value=\"Soft AP Conf\" onclick=\"location.href='SoftAP'\">"
+
+
+           "<div class=\"content\">"            
+               "<p>Temperatura modulo:<br><br><span>%d.%d C</span></p>"
+               "<p>Temperatura sensor:<br><br><span>%d C</span></p>"
+               "<p>Humedad:<br><br><span>%d %s</span></p>"
+        "</div> "
+    "</div>"
+"</body>"
+"</html>";
+  n = snprintf(p, l, start,"%",app_data.Temperature/10, app_data.Temperature%10,app_data.SPI1[0],app_data.SPI1[1],"%");
+  return n;
+}
+// Definition Info Page. Displays Mac, last version of colapp, Wifi Hardware and Software Version and platform version. 
+static rsuint32 Info(rsuint8 *BufferPtr, rsuint32 BufferLength, rsuint32 Offset, rsuint8 *DataPtr, rsuint32 Instance)
+{
+  
+  rsuint32 n = 0;
+  rsuint16 l = BufferLength;
+  rschar *p = (rschar*)BufferPtr;
+  const ApiWifiMacAddrType *pMacAddr = AppWifiGetMacAddr();
+  const char* const start = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+	"<meta charset='UTF-8'>"
+	"<title>RTX WEBSERVER</title>"
+	"<style>"
+        "body{"
+            "font-family: nunito, sans-serif;"
+            "background: #00131F;"
+        "}"
+        ".boton{"
+            "font-size: 20px;"
+            "background: #00131F;"
+            "color:#329AB4;"
+            "border: solid 3px #00131F;"
+            "font-weight: bolder;"
+            "transition: 2s;"
+        "}"
+        ".boton:hover{"
+            "color:#fff;"
+            "border-bottom: solid 3px #fff;"
+        "}"
+        ".selected{"
+            "font-size: 20px;"
+            "background: #002740;"
+            "color:white;"
+            "border: solid 3px #002740;"
+            "font-weight: bolder;"
+            "transition: 2s;"            
+        "}"
+        ".content{"
+            "background: #002740;"
+            "padding: 1em;"			
+            "text-align: center;"
+            "width: 100%;"
+            "margin: 0 auto;"
+			"font-size: 30px;"
+			"font-weight: bolder;"
+			"color:#fff;"	
+        "}"
+		".content p sub{"
+            "color:#fff;"
+			"font-size: 15px;"
+        "}"
+    "</style>"
+"</head>"
+"<body>"	
+    "<div>"
+        "<input class=\"boton\" type=\"button\" value=\"Inicio\" onclick=\"location.href='/'\">"        
+        "<input class=\"selected\" type=\"button\" value=\"Informacion\" >"
+           "<div class=\"content\">  "          
+			   "<p>Informacion del sistema<br>"
+			   "<sub>MAC: <font color=\"#66d5f0\">%02X-%02X-%02X-%02X-%02X-%02X</font></sub>" 
+			   "<br><sub>WebServer Version: <font color=\"#66d5f0\">%s 20%02X-%02X-%02X %02X:%02X</font></sub><br> "
+			   "<sub>Wifi Hw Version: <font color=\"#66d5f0\">%s</font></sub>" 
+			   "<br><sub>Wifi SW Version: <font color=\"#66d5f0\">%s </font></sub><br> "
+			   "<sub>Platform Version: <font color=\"#66d5f0\">%s</font></sub>" 
+        "</div> "
+    "</div>"
+"</body>"
+"</html>";
+
+
+  n = snprintf(p, l, start,(*pMacAddr)[0], (*pMacAddr)[1], (*pMacAddr)[2], (*pMacAddr)[3], (*pMacAddr)[4], (*pMacAddr)[5],(const char*)ReleaseLabel,LinkDate[0], LinkDate[1], LinkDate[2], LinkDate[3], LinkDate[4],app_data.HWVERSION,app_data.SWVERSION,app_data.platform);
+
+  return n;
+}
+// Definition of Configure Page. Configure SSID, Security Type and password. In SSID Input display the actual SSID.
+static rsuint32 SOFTAPPage(rsuint8 *BufferPtr, rsuint32 BufferLength, rsuint32 Offset, rsuint8 *DataPtr, rsuint32 Instance)
+{
+  
+  rsuint32 n = 0;
+  rsuint16 l = BufferLength;
+  rschar *p = (rschar*)BufferPtr;
+  
+  const char* const start = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+	"<meta charset='UTF-8'>"
+	"<title>RTX WEBSERVER</title>"
+	"<style>"
+        "body{"
+            "font-family: nunito, sans-serif;"
+            "background: #00131F;"
+        "}"
+        ".boton{"
+            "font-size: 20px;"
+            "background: #00131F;"
+            "color:#329AB4;"
+            "border: solid 3px #00131F;"
+            "font-weight: bolder;"
+            "transition: 2s;"
+        "}"
+        ".boton:hover{"
+            "color:#fff;"
+            "border-bottom: solid 3px #fff;"
+        "}"
+        ".selected{"
+            "font-size: 20px;"
+            "background: #002740;"
+            "color:white;"
+            "border: solid 3px #002740;"
+            "font-weight: bolder;"
+            "transition: 2s;"            
+        "}"
+        ".content{"
+            "background: #002740;"
+            "padding: 1em;"			
+            "text-align: left;"
+            "width: 100%;"
+            "margin: 0 auto;"
+			"font-size: 30px;"
+			"font-weight: bolder;"
+			"color:#fff;"	
+        "}"
+        ".content span{"
+            "color:#66d5f0;"
+			"font-size: 15px;"
+        "}"
+
+    "</style>"
+"</head>"
+"<body>"	
+    "<div>"
+        "<input class=\"boton\" type=\"button\" value=\"Inicio\" onclick=\"location.href='/'\">"        
+        "<input class=\"selected\" type=\"button\" value=\"Soft AP Conf\" >"
+           "<div class=\"content\">  "          
+               "<p>Configuracion Soft AP<br>"
+			   "<form action=\"softap\" method=\"get\">"
+			   "<br><span>SSID</span>  <input type=\"text\" size= 50 name=\"ssid\" value=\"%s\"> "
+			   "<span>Seguridad</span>"
+			   "<select name=\"Seguridad \">" 
+			   "<option value=\"None\">None </option>" 
+			   "<option value=\"WPA\">WPA</option>"
+               "</select>"
+			   "<br><span>Password</span>  <input type=\"text\" size= 50 name=\"ssid\" value=\"\"> "
+			   "<br><input type=\"submit\" value=\"Save Settings\">"
+			   "<form method=\"link\" action=\"/\">"
+			   "</form>"   
+        "</div> "
+    "</div>"
+"</body>"
+"</html>";
+ 
+  n = snprintf(p, l, start,AppWifiApGetSoftApSsid());
+  return n;
+}
+//Resource Callback of GenerationMainPage. Generates the Main Page resource
+static RsStatusType OnMainPage(AhHttpMethodIdType HttpMethod, rschar *PathPtr, rschar *QueryPtr, rsuint32 Instance)
+{
+  if (HttpMethod != AHM_GET)
+  {
+    return RSS_NOT_SUPPORTED;
+  }
+
+SendApiHttpServerSendResponseReq(COLA_TASK, Instance, 200, "OK", 
+                                   GenerateMainPage(NULL, 0, 0, NULL, 0), // Calc the size of the main page
+                                   NULL,                               // Static body not used  
+                                   AddHeader,                          // Call back used to add HTTP headers 
+                                   GenerateMainPage);                  // Callback used to generate the main page   
+  return RSS_SUCCESS;
+}
+//Resource Callback of InfoPage. Generates the Info Page resource
+static RsStatusType InfoPage(AhHttpMethodIdType HttpMethod, rschar *PathPtr, rschar *QueryPtr, rsuint32 Instance)
+{
+  if (HttpMethod != AHM_GET)
+  {
+    return RSS_NOT_SUPPORTED;
+  }
+
+SendApiHttpServerSendResponseReq(COLA_TASK, Instance, 200, "OK", 
+                                   Info(NULL, 0, 0, NULL, 0), // Calc the size of the main page
+                                   NULL,                               // Static body not used  
+                                   AddHeader,                          // Call back used to add HTTP headers 
+                                   Info);                  // Callback used to generate the main page   
+  return RSS_SUCCESS;
+}
+//Resource Callback of SoftAPPAGE. Generates the Conf Page resource. 
+static RsStatusType ConfSoftAP(AhHttpMethodIdType HttpMethod, rschar *PathPtr, rschar *QueryPtr, rsuint32 Instance)
+{
+  if (HttpMethod != AHM_GET)
+  {
+    return RSS_NOT_SUPPORTED;
+  }
+
+SendApiHttpServerSendResponseReq(COLA_TASK, Instance, 200, "OK", 
+                                   SOFTAPPage(NULL, 0, 0, NULL, 0), // Calc the size of the main page
+                                   NULL,                               // Static body not used  
+                                   AddHeader,                          // Call back used to add HTTP headers 
+                                   SOFTAPPage);                  // Callback used to generate the main page   
+  return RSS_SUCCESS;
+}  
+/*// I try to implement application form and implement NVS system  but I don't have time :(:(//
+static RsStatusType ConfSoftAP(AhHttpMethodIdType HttpMethod, rschar *PathPtr, rschar *QueryPtr, rsuint32 Instance)
+{
+  static const char* const okPage = 
+    "<!DOCTYPE html>"
+    "<html>"
+      "<body>"
+        "<h1>Se ha modificado los parametros correctament. Reinicia el modulo</h1>"
+        "<form method=\"link\" action=\"/\">"
+        "<input type=\"submit\" value=\"OK\">"
+        "</form>"
+      "</body>"
+    "</html>";
+  static const char* const failPage = 
+    "<!DOCTYPE html>"
+    "<html>"
+      "<body>"
+        "<h1>No has introducido la contraseña!</h1>"
+        "<form method=\"link\" action=\"/SOFTAPPage\">"
+        "<input type=\"submit\" value=\"OK\">"
+        "</form>"
+      "</body>"
+    "</html>";
+ AhQueryDataType query[3];
+  rsuint8 queryCount = HttpSplitQueryString(3, query, QueryPtr);
+
+  if (HttpMethod != AHM_GET)
+  {
+    return RSS_NOT_SUPPORTED;
+  }
+
+  if (queryCount == 3)
+  {
+    rschar ssid [25];
+	rschar SecurityType [25];
+    rschar Key [25];
+    
+    // Static ip ?
+    if (query[0].ValuePtr[0] == '1')
+    {
+      ok = FALSE;
+      if ((query[0].ValuePtr,)==NULL)
+      {
+        if ((query[1].ValuePtr)=="NONE")
+        {
+          if (query[2].ValuePtr)==NULL)
+          {
+            ok = TRUE;
+          }
+        }
+      }
+    }
+    else
+    {
+      SendApiHttpServerSendResponseReq(COLA_TASK, Instance, 200, "OK", strlen(failPage), (rsuint8*)failPage, NULL, NULL);
+	  return RSS_SUCCESS;
+    }
+  }
+  else
+  {
+    SendApiHttpServerSendResponseReq(COLA_TASK, Instance, 200, "OK", SOFTAPPage(NULL, 0, 0, NULL, 0), NULL, NULL, SOFTAPPage);
+	return RSS_SUCCESS;
+  }
+  return RSS_SUCCESS;
+}
+  
+}  
+*/
+
+/**
+ * @brief : It controls the SPI communication. This implementation reads commands, but the main protothread only reads temperatures
+            In future works, the implementation of command SPI, will activate SOFT AP and Web Server modes and read temperatures.
+ * @param Pt : current protothread pointer
+ * @param Mail : protothread mail
+ **/
+static PT_THREAD(SPI_temperatures(struct pt *Pt, const RosMailType *Mail)) {
+    static struct pt childPt;
+    PT_BEGIN(Pt);
+    
+    //SPI SLAVE
+        //define baud rate
+        const rsuint32 baud_rate = 9600;
+        
+		// starts  SPI slave driver
+        PT_SPAWN(Pt, &childPt, PtDrvSpiSlaveInit(&childPt, Mail, baud_rate));
+		// Defines a loop while command is equal command 16 or 17
+        //if(app_data.SPI1[2]==16 || 17){	
+             //while (app_data.SPI1[2]==16 || 17) {
+			  while(1){
+			  // waits to receibed a SPI data	 
+			   PT_WAIT_UNTIL(Pt, IS_RECEIVED(SPI_SLAVE_RX_DATA));
+               RosTimerStart(APP_PACKET_DELAY_TIMER, (3000 * RS_T1MS), &PacketDelayTimer);
+			   PT_YIELD_UNTIL(Pt, IS_RECEIVED(APP_PACKET_DELAY_TIMEOUT));  
+               
+             //reads and put data in buffer			   
+               rsuint8 recibidospi[DrvSpiSlaveRxGetSize()];
+               DrvSpiSlaveRx(&recibidospi[0], sizeof(recibidospi));
+               
+               app_data.SPI1[0] = recibidospi[0];
+               app_data.SPI1[1] = recibidospi[1];
+               app_data.SPI1[2] = recibidospi[2];  			
+               
+             // sends the same data to Arduino  
+               DrvSpiSlaveTxStart(&app_data.SPI1[0], 3);
+			 // empty the buffer  
+			   DrvSpiSlaveRxFlush();
+        }
+/*Protothread exit if command is different that 16 or 17
+ PT_EXIT(Pt);		
+}
+		// Defines a loop while command is different 16 or 17
+        while (app_data.SPI1[2]!=16 || 17) {
+
+			  PT_WAIT_UNTIL(Pt, IS_RECEIVED(SPI_SLAVE_RX_DATA));
+              RosTimerStart(APP_PACKET_DELAY_TIMER, (3000 * RS_T1MS), &PacketDelayTimer);
+			  PT_YIELD_UNTIL(Pt, IS_RECEIVED(APP_PACKET_DELAY_TIMEOUT));  
+              
+              printf ("Intentando enviar datos...\n");
+              
+              rsuint8 recibidospi[DrvSpiSlaveRxGetSize()];
+              DrvSpiSlaveRx(&recibidospi[0], sizeof(recibidospi));
+              
+              app_data.SPI1[0] = recibidospi[0];
+              app_data.SPI1[1] = recibidospi[1];
+              app_data.SPI1[2] = recibidospi[2];  			        
+              
+              DrvSpiSlaveTxStart(&app_data.SPI1[0], 3);
+              printf("ENVIADO\n");
+			  DrvSpiSlaveRxFlush();
+        }
+*/
+    PT_END(Pt);
+}
+
+/**
+ * @brief Main implementation protothread. Starts Soft AP, Intern Driver Temperature of RTX, Reads Wifi HW&SW and platform version,
+          Starts HTTP server, add pages and starts the SPI communication
+		  In future works, when command SPI works, this protothread only starts Http Server and add pages.
+ * @param Pt : current protothread pointer
+ * @param Mail : protothread mail
+ **/
+ 
+static PT_THREAD(WebServer(struct pt *Pt, const RosMailType* Mail))
+{
+	static struct pt SensorUpdatePt;
+	static struct pt childPt;
+  PT_BEGIN(Pt);
+    // Starts Soft Ap MODE
+	PT_SPAWN(Pt, &childPt, SoftAPMode(&childPt, Mail));
+	// Measure internal temperature inside the EFM32 chip
+	PT_SPAWN(Pt, &SensorUpdatePt, PtDrvIntTempMeasure(&SensorUpdatePt, Mail, &app_data.Temperature));
+	//Reads the Wifi Hardware and Software Version
+	SendApiWifiGetVersionReq(COLA_TASK);
+    PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_WIFI_GET_VERSION_CFM));
+    sprintf(app_data.SWVERSION, "%d.%d.%d.%d.%d",
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->SwVersion & 0xF0000000) >> 28,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->SwVersion & 0x0F000000) >> 24,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->SwVersion & 0x00FC0000) >> 18,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->SwVersion & 0x0003FF00) >> 8,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->SwVersion & 0x000000FF));
+    sprintf(app_data.HWVERSION, "%d.%d.%d.%d.%d",
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->HwVersion & 0xF0000000) >> 28,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->HwVersion & 0x0F000000) >> 24,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->HwVersion & 0x00FC0000) >> 18,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->HwVersion & 0x0003FF00) >> 8,
+          (int)(((ApiWifiGetVersionCfmType *)Mail)->HwVersion & 0x000000FF));
+	//Reads the Platform Version
+    SendApiGetPlatformVersionReq(COLA_TASK);
+    PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_GET_PLATFORM_VERSION_CFM));
+    sprintf(app_data.platform, "%X.%X.%X.%X (20%02X-%02X-%02X %02X:%02X)",
+          ((ApiGetPlatformVersionCfmType *)Mail)->Version >> 8,
+          (rsuint8)((ApiGetPlatformVersionCfmType *)Mail)->Version,
+          ((ApiGetPlatformVersionCfmType *)Mail)->SubVersion,
+          ((ApiGetPlatformVersionCfmType *)Mail)->BuildNumber,
+          ((ApiGetPlatformVersionCfmType *)Mail)->LinkDate[0],
+          ((ApiGetPlatformVersionCfmType *)Mail)->LinkDate[1],
+          ((ApiGetPlatformVersionCfmType *)Mail)->LinkDate[2],
+          ((ApiGetPlatformVersionCfmType *)Mail)->LinkDate[3],
+          ((ApiGetPlatformVersionCfmType *)Mail)->LinkDate[4]);
+  // Start HTTP server
+  SendApiHttpServerInitReq(COLA_TASK, 80, NULL);
+  PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_HTTP_SERVER_INIT_CFM) && ((ApiHttpServerInitCfmType*)Mail)->Port == 80);
+  if (((ApiHttpServerInitCfmType*)Mail)->Status == RSS_SUCCESS)
+  {
+    // Server started
+    app_data.HttpServerStarted = TRUE;
+    app_data.HttpInstance = ((ApiHttpServerInitCfmType*)Mail)->Instance;
+
+    // Add main page
+    SendApiHttpServerAddResourceReq(COLA_TASK, app_data.HttpInstance, "/", OnMainPage);
+	SendApiHttpServerAddResourceReq(COLA_TASK, app_data.HttpInstance, "/Info", InfoPage);
+	SendApiHttpServerAddResourceReq(COLA_TASK, app_data.HttpInstance, "/SoftAP", ConfSoftAP);	
+  }
+  PT_SPAWN(Pt, &childPt, SPI_temperatures(&childPt, Mail));
+  PT_END(Pt);
+}
+
+//////////////////**************END IMPLEMENTATION***********///////////////////////
 /**
  * @brief Test procedure which can be called from the debug terminal
  * @param Pt : current protothread pointer
@@ -1019,6 +1602,8 @@ static PT_THREAD(PtTest(struct pt *Pt, const RosMailType *Mail)) {
 
   PT_END(Pt);
 }
+
+
 
 /**
  * @brief Main protothread. It controls the SPI or the debug terminal
@@ -1173,23 +1758,21 @@ static PT_THREAD(PtMain(struct pt *Pt, const RosMailType *Mail)) {
     ShellRxIdx = 0;
   }
   #endif
-  
+ 
   #ifdef SPI_COMMUNICATION
-  // Init SPI
-  const rsuint32 baud_rate = 9600;
-  PT_SPAWN(Pt, &childPt, PtDrvSpiInit(&childPt, Mail, baud_rate));
-  DrvSpiInit(baud_rate);
+
   
+//////////////********* ALEJANDRO COMMAND IMPLEMENTATION**************//////
+// Whent Initialize SOFT AP or close HTTP server, the SPI comunication close too...No sense!!! >o<'
+// Actually the application starts directly in Webserver Protothread!! Sorry guys! :(
   while (1) {
+
     // Wait until SPI data is received
-    PT_WAIT_UNTIL(Pt, IS_RECEIVED(SPI_RX_DATA));
-    
-    // Read SPI command
-    rsuint8 command;
-    DrvSpiRx(&command, sizeof(command));
-    PT_WAIT_UNTIL(Pt, IS_RECEIVED(SPI_RX_DATA));
-    
-    switch (command) {
+
+	PT_SPAWN(Pt, &childPt, SPI_temperatures(&childPt, Mail));
+
+
+    switch (app_data.SPI1[2]) {
       case 1: { // get status
         rsuint8 status = Wifi_get_status();
         DrvSpiTxStart(&status, 1);
@@ -1348,9 +1931,22 @@ static PT_THREAD(PtMain(struct pt *Pt, const RosMailType *Mail)) {
         PT_SPAWN(Pt, &childPt, PtWifi_resume(&childPt, Mail));
         break;
       }
-
+      case 16: { // Mode Soft AP . This mode init SoftAp mode, starts DHCP server,	
+        //PT_SPAWN(Pt, &childPt, SoftAPMode(&childPt, Mail));
+        break;
+      }	  
+      case 17: { // Mode Webserver. Initialize the WEB and read the temperatures
+		/*PT_SPAWN(Pt, &childPt, WebServer(&childPt, Mail));
+        PT_SPAWN(Pt, &childPt, SPI_temperatures(&childPt, Mail));
+		if (app_data.HttpServerStarted)
+        {
+          SendApiHttpTerminateReq(COLA_TASK, 80);
+          PT_WAIT_UNTIL(Pt, IS_RECEIVED(API_HTTP_TERMINATE_CFM) && ((ApiHttpTerminateCfmType*)Mail)->Instance == app_data.HttpInstance);
+          app_data.HttpServerStarted = FALSE;
+        }*/
+        break;
+      }
     }
-
   }
   #endif
 
@@ -1370,6 +1966,8 @@ void ColaTask(const RosMailType *Mail) {
 
       // Init the Buttons driver
       DrvButtonsInit();
+	  
+	  DrvIntTemp_Init();
 
       // Init the Protothreads lib
       PtInit(&PtList);
@@ -1381,7 +1979,8 @@ void ColaTask(const RosMailType *Mail) {
       AppWifiInit(&PtList);
 
       // Start the Main protothread
-      PtStart(&PtList, PtMain, NULL, NULL);
+      //PtStart(&PtList, PtMain, NULL, NULL);
+      PtStart(&PtList, WebServer, NULL, NULL);
       break;
 
     case TERMINATETASK:
@@ -1395,7 +1994,7 @@ void ColaTask(const RosMailType *Mail) {
       if (((ApiSocketSendCfmType *)Mail)->Status == RSS_SUCCESS)
         PRINTLN("Send OK");
       else
-        PRINTLN("Send ERROR");
+      PRINTLN("Send ERROR");
       #endif
       break;
 
